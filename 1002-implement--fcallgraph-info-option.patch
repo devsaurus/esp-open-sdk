@@ -1,0 +1,898 @@
+Index: gcc/doc/invoke.texi
+===================================================================
+--- a/gcc/doc/invoke.texi	(revision 188651)
++++ b/gcc/doc/invoke.texi	(working copy)
+@@ -326,7 +326,7 @@ -feliminate-dwarf2-dups -fno-eliminate-unused-debug-types @gol
+ -feliminate-unused-debug-symbols -femit-class-debug-always @gol
+ -fenable-@var{kind}-@var{pass} @gol
+ -fenable-@var{kind}-@var{pass}=@var{range-list} @gol
+--fdebug-types-section -fmem-report-wpa @gol
++-fcallgraph-info@r{[}=su,da@r{]} -fdebug-types-section -fmem-report-wpa @gol
+ -fmem-report -fpre-ipa-mem-report -fpost-ipa-mem-report -fprofile-arcs @gol
+ -fopt-info @gol
+ -fopt-info-@var{options}@r{[}=@var{file}@r{]} @gol
+@@ -5295,6 +5295,18 @@ the function.  If it is not present, the
+ not bounded at compile time and the second field only represents the
+ bounded part.
+ 
++@item -fcallgraph-info
++@itemx -fcallgraph-info=@var{MARKERS}
++@opindex fcallgraph-info
++Makes the compiler output callgraph information for the program, on a
++per-file basis.  The information is generated in the common VCG format.
++It can be decorated with additional, per-node and/or per-edge information,
++if a list of comma-separated markers is additionally specified.  When the
++@code{su} marker is specified, the callgraph is decorated with stack usage
++information; it is equivalent to @option{-fstack-usage}.  When the @code{da}
++marker is specified, the callgraph is decorated with information about
++dynamically allocated objects.
++
+ @item -fprofile-arcs
+ @opindex fprofile-arcs
+ Add code so that program flow @dfn{arcs} are instrumented.  During
+Index: gcc/cgraph.c
+===================================================================
+--- a/gcc/cgraph.c	(revision 188647)
++++ b/gcc/cgraph.c	(working copy)
+@@ -45,7 +45,9 @@ along with GCC; see the file COPYING3.
+ #include "tree-flow.h"
+ #include "value-prof.h"
+ #include "except.h"
++#include "expr.h"
+ #include "diagnostic-core.h"
++#include "output.h"
+ #include "rtl.h"
+ #include "ipa-utils.h"
+ #include "lto-streamer.h"
+@@ -513,6 +513,8 @@ cgraph_create_empty_node (void)
+   node->symbol.type = SYMTAB_FUNCTION;
+   node->frequency = NODE_FREQUENCY_NORMAL;
+   node->count_materialization_scale = REG_BR_PROB_BASE;
++  if (flag_callgraph_info)
++    node->final = ggc_alloc_cleared_cgraph_final_info ();
+   cgraph_n_nodes++;
+   return node;
+ }
+@@ -1446,6 +1446,57 @@ cgraph_global_info (tree decl)
+   return &node->global;
+ }
+ 
++/* Create edge from CALLER to CALLEE in the final cgraph.  */
++
++static struct cgraph_final_edge *
++final_create_edge (struct cgraph_node *caller, struct cgraph_node *callee,
++		   location_t location)
++{
++  struct cgraph_final_edge *e = ggc_alloc_cleared_cgraph_final_edge ();
++  e->location = location;
++  e->caller = caller;
++  e->callee = callee;
++  e->next = caller->final->calls;
++  caller->final->calls = e;
++  return e;
++}
++
++/* Record call from SOURCE to DEST in the final cgraph.  */
++
++void
++cgraph_final_record_call (tree source, tree dest, location_t location)
++{
++  struct cgraph_node *callee;
++
++  if (dest)
++    {
++      callee = cgraph_get_create_node (dest);
++      callee->final->called = true;
++    }
++  else
++    callee = NULL;
++
++  (void) final_create_edge (cgraph_get_node (source), callee, location);
++}
++
++/* Record a dynamically-allocated DECL in the final cgraph of FNDECL.  */
++
++void
++cgraph_final_record_dynamic_alloc (tree fndecl, tree decl)
++{
++  const char *dot;
++  struct cgraph_final_info *cfi = cgraph_final_info (fndecl);
++  struct cgraph_dynamic_alloc *cda = ggc_alloc_cleared_cgraph_dynamic_alloc ();
++  cda->location = DECL_SOURCE_LOCATION (decl);
++  cda->name = lang_hooks.decl_printable_name (decl, 2);
++  dot = strrchr (cda->name, '.');
++  if (dot)
++    cda->name = dot + 1;
++  cda->name = ggc_strdup (cda->name);
++  cda->next = cfi->dynamic_allocs;
++  cfi->dynamic_allocs = cda;
++}
++
+ /* Return local info for the compiled function.  */
+ 
+ struct cgraph_rtl_info *
+@@ -1462,6 +1517,21 @@ cgraph_rtl_info (tree decl)
+   return &node->rtl;
+ }
+ 
++/* Return final info for the compiled function.  */
++
++struct cgraph_final_info *
++cgraph_final_info (tree decl)
++{
++  struct cgraph_node *node;
++  
++  gcc_assert (TREE_CODE (decl) == FUNCTION_DECL);
++  node = cgraph_get_node (decl);
++  if (decl != current_function_decl
++      && !TREE_ASM_WRITTEN (node->symbol.decl))
++    return NULL;
++  return node->final;
++}
++
+ /* Return a string describing the failure REASON.  */
+ 
+ const char*
+@@ -1636,6 +1706,178 @@ debug_cgraph (void)
+   dump_cgraph (stderr);
+ }
+ 
++
++/* Dump placeholder node for indirect calls in VCG format.  */
++
++#define INDIRECT_CALL_NAME  "__indirect_call"
++
++static void
++dump_cgraph_final_indirect_call_node_vcg (FILE *f)
++{
++  static bool emitted = false;
++  if (emitted)
++    return;
++
++  fputs ("node: { title: \"", f);
++  fputs (INDIRECT_CALL_NAME, f);
++  fputs ("\" label: \"", f);
++  fputs ("Indirect Call Placeholder", f);
++  fputs ("\" shape : ellipse }\n", f);
++  emitted = true;
++}
++
++/* Dump final cgraph edge in VCG format.  */
++
++static void
++dump_cgraph_final_edge_vcg (FILE *f, struct cgraph_final_edge *edge)
++{
++  fputs ("edge: { sourcename: \"", f);
++  print_decl_identifier (f, edge->caller->symbol.decl, PRINT_DECL_UNIQUE_NAME);
++  fputs ("\" targetname: \"", f);
++  if (edge->callee)
++    print_decl_identifier (f, edge->callee->symbol.decl, PRINT_DECL_UNIQUE_NAME);
++  else
++    fputs (INDIRECT_CALL_NAME, f);
++  if (edge->location != UNKNOWN_LOCATION)
++    {
++      expanded_location loc;
++      fputs ("\" label: \"", f);
++      loc = expand_location (edge->location);
++      fprintf (f, "%s:%d:%d", loc.file, loc.line, loc.column);
++    }
++  fputs ("\" }\n", f);
++
++  if (!edge->callee)
++    dump_cgraph_final_indirect_call_node_vcg (f);
++}
++
++/* Dump final cgraph node in VCG format.  */
++
++static void
++dump_cgraph_final_node_vcg (FILE *f, struct cgraph_node *node)
++{
++  struct cgraph_final_edge *edge;
++
++  fputs ("node: { title: \"", f);
++  print_decl_identifier (f, node->symbol.decl, PRINT_DECL_UNIQUE_NAME);
++  fputs ("\" label: \"", f);
++  print_decl_identifier (f, node->symbol.decl, PRINT_DECL_NAME);
++  fputs ("\\n", f);
++  print_decl_identifier (f, node->symbol.decl, PRINT_DECL_ORIGIN);
++
++  if (DECL_EXTERNAL (node->symbol.decl))
++    {
++      fputs ("\" shape : ellipse }\n", f);
++      return;
++    }
++
++  if (flag_callgraph_info & CALLGRAPH_INFO_STACK_USAGE)
++    {
++      if (node->final->stack_usage)
++	fprintf (f, "\\n"HOST_WIDE_INT_PRINT_DEC" bytes (%s)",
++		 node->final->stack_usage,
++		 stack_usage_qual[node->final->stack_usage_kind]);
++      else
++	fputs ("\\n0 bytes", f);
++    }
++
++  if (flag_callgraph_info & CALLGRAPH_INFO_DYNAMIC_ALLOC)
++    {
++      if (node->final->dynamic_allocs)
++	{
++	  struct cgraph_dynamic_alloc *cda, *next;
++	  unsigned int count = 1;
++
++	  /* Reverse the linked list and count members.  */
++	  cda = node->final->dynamic_allocs;
++	  next = cda->next;
++	  cda->next = NULL;
++	  while (next)
++	    {
++	      struct cgraph_dynamic_alloc *tmp = next;
++	      next = next->next;
++	      tmp->next = cda;
++	      cda = tmp;
++	      count++;
++	    }
++	  node->final->dynamic_allocs = cda;
++
++	  fprintf (f, "\\n%d dynamic objects", count);
++
++	  for (cda = node->final->dynamic_allocs; cda; cda = cda->next)
++	    {
++	      expanded_location loc = expand_location (cda->location);
++	      fprintf (f, "\\n %s", cda->name);
++	      fprintf (f, " %s:%d:%d", loc.file, loc.line, loc.column);
++	    }
++	}
++      else
++	fputs ("\\n0 dynamic objects", f);
++    }
++
++  fputs ("\" }\n", f);
++
++  for (edge = node->final->calls; edge; edge = edge->next)
++    dump_cgraph_final_edge_vcg (f, edge);
++}
++
++/* Return true if NODE is needed in the final callgraph.  */
++
++static inline bool
++external_node_needed_p (struct cgraph_node *node)
++{
++  static bool memcpy_node_seen = false;
++  static bool memset_node_seen = false;
++
++  /* External node that are eventually not called are not needed.  */
++  if (!node->final->called)
++    return false;
++
++  /* Take care of not emitting the MEMCPY node twice because of the
++     late creation of a clone by the RTL expander.  */
++  if ((DECL_BUILT_IN_CLASS (node->symbol.decl) == BUILT_IN_NORMAL
++       && DECL_FUNCTION_CODE (node->symbol.decl) == BUILT_IN_MEMCPY)
++      || node->symbol.decl == block_move_fn)
++    {
++      if (memcpy_node_seen)
++	return false;
++      else
++	memcpy_node_seen = true;
++    }
++
++  /* Likewise for the MEMSET node.  */
++  if ((DECL_BUILT_IN_CLASS (node->symbol.decl) == BUILT_IN_NORMAL
++       && DECL_FUNCTION_CODE (node->symbol.decl) == BUILT_IN_MEMSET)
++      || node->symbol.decl == block_clear_fn)
++    {
++      if (memset_node_seen)
++	return false;
++      else
++	memset_node_seen = true;
++    }
++
++  return true;
++}
++
++/* Dump the final cgraph in VCG format.  */
++
++void
++dump_cgraph_final_vcg (FILE *f)
++{
++  struct cgraph_node *node;
++
++  /* Write the file header.  */
++  fprintf (f, "graph: { title: \"%s\"\n", main_input_filename);
++
++  /* Output only nodes that have been written in the final code.  */
++  FOR_EACH_FUNCTION (node)
++    if ((DECL_EXTERNAL (node->symbol.decl) && external_node_needed_p (node))
++	|| TREE_ASM_WRITTEN (node->symbol.decl))
++      dump_cgraph_final_node_vcg (f, node);
++
++  fputs ("}\n", f);
++}
++
+ /* Return true when the DECL can possibly be inlined.  */
+ bool
+ cgraph_function_possibly_inlined_p (tree decl)
+Index: gcc/cgraph.h
+===================================================================
+--- a/gcc/cgraph.h	(revision 188647)
++++ b/gcc/cgraph.h	(working copy)
+@@ -199,6 +199,34 @@ struct GTY(()) cgraph_clone_info
+ };
+ 
+ 
++/* Information about the function that is computed by various parts of
++   the compiler.  Available only for functions that have been already
++   assembled and if -fcallgraph-info was specified.  */
++
++struct GTY((chain_next ("%h.next"))) cgraph_final_edge
++{
++  location_t location;
++  struct cgraph_node *caller;
++  struct cgraph_node *callee;
++  struct cgraph_final_edge *next;
++};
++
++struct GTY((chain_next ("%h.next"))) cgraph_dynamic_alloc
++{
++  location_t location;
++  const char *name;
++  struct cgraph_dynamic_alloc *next;
++};
++
++struct GTY(()) cgraph_final_info
++{
++  struct cgraph_final_edge *calls;
++  int stack_usage_kind;
++  HOST_WIDE_INT stack_usage;
++  struct cgraph_dynamic_alloc *dynamic_allocs;
++  bool called;
++};
++
+ /* The cgraph data structure.
+    Each function decl has assigned cgraph_node listing callees and callers.  */
+ 
+@@ -243,6 +271,8 @@ struct GTY(()) cgraph_node {
+   struct cgraph_clone_info clone;
+   struct cgraph_thunk_info thunk;
+ 
++  struct cgraph_final_info *final;
++
+   /* Expected number of executions: calculated in profile.c.  */
+   gcov_type count;
+   /* How to scale counts at materialization time; used to merge
+@@ -559,6 +589,7 @@ void symtab_make_decl_local (tree);
+ 
+ /* In cgraph.c  */
+ void dump_cgraph (FILE *);
++void dump_cgraph_final_vcg (FILE *);
+ void debug_cgraph (void);
+ void dump_cgraph_node (FILE *, struct cgraph_node *);
+ void debug_cgraph_node (struct cgraph_node *);
+@@ -583,9 +614,12 @@ struct cgraph_node *cgraph_node_for_asm
+ struct cgraph_edge *cgraph_edge (struct cgraph_node *, gimple);
+ void cgraph_set_call_stmt (struct cgraph_edge *, gimple);
+ void cgraph_update_edges_for_call_stmt (gimple, tree, gimple);
++void cgraph_final_record_call (tree, tree, location_t);
++void cgraph_final_record_dynamic_alloc (tree, tree);
+ struct cgraph_local_info *cgraph_local_info (tree);
+ struct cgraph_global_info *cgraph_global_info (tree);
+ struct cgraph_rtl_info *cgraph_rtl_info (tree);
++struct cgraph_final_info *cgraph_final_info (tree);
+ struct cgraph_node *cgraph_create_function_alias (tree, tree);
+ void cgraph_call_node_duplication_hooks (struct cgraph_node *,
+ 					 struct cgraph_node *);
+Index: gcc/libfuncs.h
+===================================================================
+--- a/gcc/libfuncs.h	(revision 188647)
++++ b/gcc/libfuncs.h	(working copy)
+@@ -26,10 +26,8 @@ along with GCC; see the file COPYING3.
+ enum libfunc_index
+ {
+   LTI_abort,
+-  LTI_memcpy,
+   LTI_memmove,
+   LTI_memcmp,
+-  LTI_memset,
+   LTI_setbits,
+ 
+   LTI_setjmp,
+@@ -83,10 +81,8 @@ extern struct target_libfuncs *this_targ
+ /* Accessor macros for libfunc_table.  */
+ 
+ #define abort_libfunc	(libfunc_table[LTI_abort])
+-#define memcpy_libfunc	(libfunc_table[LTI_memcpy])
+ #define memmove_libfunc	(libfunc_table[LTI_memmove])
+ #define memcmp_libfunc	(libfunc_table[LTI_memcmp])
+-#define memset_libfunc	(libfunc_table[LTI_memset])
+ #define setbits_libfunc	(libfunc_table[LTI_setbits])
+ 
+ #define setjmp_libfunc	(libfunc_table[LTI_setjmp])
+Index: gcc/optabs.c
+===================================================================
+--- a/gcc/optabs.c	(revision 188647)
++++ b/gcc/optabs.c	(working copy)
+@@ -6042,10 +6042,6 @@ build_libfunc_function (const char *name
+   TREE_PUBLIC (decl) = 1;
+   gcc_assert (DECL_ASSEMBLER_NAME (decl));
+ 
+-  /* Zap the nonsensical SYMBOL_REF_DECL for this.  What we're left with
+-     are the flags assigned by targetm.encode_section_info.  */
+-  SET_SYMBOL_REF_DECL (XEXP (DECL_RTL (decl), 0), NULL);
+-
+   return decl;
+ }
+ 
+@@ -6186,10 +6182,8 @@ init_optabs (void)
+     set_optab_libfunc (abs_optab, TYPE_MODE (complex_double_type_node), "cabs");
+ 
+   abort_libfunc = init_one_libfunc ("abort");
+-  memcpy_libfunc = init_one_libfunc ("memcpy");
+   memmove_libfunc = init_one_libfunc ("memmove");
+   memcmp_libfunc = init_one_libfunc ("memcmp");
+-  memset_libfunc = init_one_libfunc ("memset");
+   setbits_libfunc = init_one_libfunc ("__setbits");
+ 
+ #ifndef DONT_USE_BUILTIN_SETJMP
+Index: gcc/tree.h
+===================================================================
+--- a/gcc/tree.h	(revision 188647)
++++ b/gcc/tree.h	(working copy)
+@@ -5995,6 +5995,10 @@ extern void print_vec_tree (FILE *, cons
+ extern void print_node_brief (FILE *, const char *, const_tree, int);
+ extern void indent_to (FILE *, int);
+ #endif
++#define PRINT_DECL_ORIGIN       0x1
++#define PRINT_DECL_NAME         0x2
++#define PRINT_DECL_UNIQUE_NAME  0x4
++extern void print_decl_identifier (FILE *, tree, int flags);
+ 
+ /* In tree-inline.c:  */
+ extern bool debug_find_tree (tree, tree);
+Index: gcc/builtins.c
+===================================================================
+--- a/gcc/builtins.c	(revision 188647)
++++ b/gcc/builtins.c	(working copy)
+@@ -14368,11 +14368,9 @@ set_builtin_user_assembler_name (tree de
+     {
+     case BUILT_IN_MEMCPY:
+       init_block_move_fn (asmspec);
+-      memcpy_libfunc = set_user_assembler_libfunc ("memcpy", asmspec);
+       break;
+     case BUILT_IN_MEMSET:
+       init_block_clear_fn (asmspec);
+-      memset_libfunc = set_user_assembler_libfunc ("memset", asmspec);
+       break;
+     case BUILT_IN_MEMMOVE:
+       memmove_libfunc = set_user_assembler_libfunc ("memmove", asmspec);
+Index: gcc/toplev.c
+===================================================================
+--- a/gcc/toplev.c	(revision 188647)
++++ b/gcc/toplev.c	(working copy)
+@@ -167,6 +167,7 @@ const char *user_label_prefix;
+ 
+ FILE *asm_out_file;
+ FILE *aux_info_file;
++FILE *callgraph_info_file = NULL;
+ FILE *stack_usage_file = NULL;
+ 
+ /* The current working directory of a translation.  It's generally the
+@@ -965,17 +968,13 @@ alloc_for_identifier_to_locale (size_t l
+   return ggc_alloc_atomic (len);
+ }
+ 
++const char *stack_usage_qual[] = { "static", "dynamic", "dynamic,bounded" };
++
+ /* Output stack usage information.  */
+ void
+ output_stack_usage (void)
+ {
+   static bool warning_issued = false;
+-  enum stack_usage_kind_type { STATIC = 0, DYNAMIC, DYNAMIC_BOUNDED };
+-  const char *stack_usage_kind_str[] = {
+-    "static",
+-    "dynamic",
+-    "dynamic,bounded"
+-  };
+   HOST_WIDE_INT stack_usage = current_function_static_stack_size;
+   enum stack_usage_kind_type stack_usage_kind;
+ 
+@@ -989,61 +986,53 @@ output_stack_usage (void)
+       return;
+     }
+ 
+-  stack_usage_kind = STATIC;
++  stack_usage_kind = SU_STATIC;
+ 
+   /* Add the maximum amount of space pushed onto the stack.  */
+   if (current_function_pushed_stack_size > 0)
+     {
+       stack_usage += current_function_pushed_stack_size;
+-      stack_usage_kind = DYNAMIC_BOUNDED;
++      stack_usage_kind = SU_DYNAMIC_BOUNDED;
+     }
+ 
+   /* Now on to the tricky part: dynamic stack allocation.  */
+   if (current_function_allocates_dynamic_stack_space)
+     {
+       if (current_function_has_unbounded_dynamic_stack_size)
+-	stack_usage_kind = DYNAMIC;
++	stack_usage_kind = SU_DYNAMIC;
+       else
+-	stack_usage_kind = DYNAMIC_BOUNDED;
++	stack_usage_kind = SU_DYNAMIC_BOUNDED;
+ 
+       /* Add the size even in the unbounded case, this can't hurt.  */
+       stack_usage += current_function_dynamic_stack_size;
+     }
+ 
+-  if (flag_stack_usage)
++  if (flag_callgraph_info & CALLGRAPH_INFO_STACK_USAGE)
+     {
+-      expanded_location loc
+-	= expand_location (DECL_SOURCE_LOCATION (current_function_decl));
+-      const char *raw_id, *id;
+-
+-      /* Strip the scope prefix if any.  */
+-      raw_id = lang_hooks.decl_printable_name (current_function_decl, 2);
+-      id = strrchr (raw_id, '.');
+-      if (id)
+-	id++;
+-      else
+-	id = raw_id;
++      struct cgraph_final_info *cfi
++	= cgraph_final_info (current_function_decl);
++      cfi->stack_usage = stack_usage;
++      cfi->stack_usage_kind = stack_usage_kind;
++    }
+ 
+-      fprintf (stack_usage_file,
+-	       "%s:%d:%d:%s\t"HOST_WIDE_INT_PRINT_DEC"\t%s\n",
+-	       lbasename (loc.file),
+-	       loc.line,
+-	       loc.column,
+-	       id,
+-	       stack_usage,
+-	       stack_usage_kind_str[stack_usage_kind]);
++  if (flag_stack_usage)
++    {
++      print_decl_identifier (stack_usage_file, current_function_decl,
++			     PRINT_DECL_ORIGIN | PRINT_DECL_NAME);
++      fprintf (stack_usage_file, "\t"HOST_WIDE_INT_PRINT_DEC"\t%s\n",
++	       stack_usage, stack_usage_qual[stack_usage_kind]);
+     }
+ 
+   if (warn_stack_usage >= 0)
+     {
+       const location_t loc = DECL_SOURCE_LOCATION (current_function_decl);
+
+-      if (stack_usage_kind == DYNAMIC)
++      if (stack_usage_kind == SU_DYNAMIC)
+ 	warning_at (loc, OPT_Wstack_usage_, "stack usage might be unbounded");
+       else if (stack_usage > warn_stack_usage)
+ 	{
+-	  if (stack_usage_kind == DYNAMIC_BOUNDED)
++	  if (stack_usage_kind == SU_DYNAMIC_BOUNDED)
+ 	    warning_at (loc,
+			OPT_Wstack_usage_, "stack usage might be %wd bytes",
+			stack_usage);
+ 	  else
+@@ -1700,6 +1688,10 @@ lang_dependent_init (const char *name)
+       /* If stack usage information is desired, open the output file.  */
+       if (flag_stack_usage)
+ 	stack_usage_file = open_auxiliary_file ("su");
++
++      /* If call graph information is desired, open the output file.  */
++      if (flag_callgraph_info)
++	callgraph_info_file = open_auxiliary_file ("ci");
+     }
+ 
+   /* This creates various _DECL nodes, so needs to be called after the
+@@ -1804,6 +1796,12 @@ finalize (bool no_backend)
+   if (stack_usage_file)
+     fclose (stack_usage_file);
+ 
++  if (callgraph_info_file)
++    {
++      dump_cgraph_final_vcg (callgraph_info_file);
++      fclose (callgraph_info_file);
++    }
++
+   if (!no_backend)
+     {
+       statistics_fini ();
+Index: gcc/expr.c
+===================================================================
+--- a/gcc/expr.c	(revision 188647)
++++ b/gcc/expr.c	(working copy)
+@@ -1364,6 +1364,7 @@ emit_block_move_via_libcall (rtx dst, rt
+   fn = emit_block_move_libcall_fn (true);
+   call_expr = build_call_expr (fn, 3, dst_tree, src_tree, size_tree);
+   CALL_EXPR_TAILCALL (call_expr) = tailcall;
++  SET_EXPR_LOCATION (call_expr, input_location);
+ 
+   retval = expand_normal (call_expr);
+ 
+@@ -1373,7 +1374,7 @@ emit_block_move_via_libcall (rtx dst, rt
+ /* A subroutine of emit_block_move_via_libcall.  Create the tree node
+    for the function we use for block copies.  */
+ 
+-static GTY(()) tree block_move_fn;
++tree block_move_fn;
+ 
+ void
+ init_block_move_fn (const char *asmspec)
+@@ -2798,6 +2799,7 @@ set_storage_via_libcall (rtx object, rtx
+   fn = clear_storage_libcall_fn (true);
+   call_expr = build_call_expr (fn, 3, object_tree, val_tree, size_tree);
+   CALL_EXPR_TAILCALL (call_expr) = tailcall;
++  SET_EXPR_LOCATION (call_expr, input_location);
+ 
+   retval = expand_normal (call_expr);
+ 
+@@ -11196,5 +11198,3 @@ get_personality_function (tree decl)
+ 
+   return XEXP (DECL_RTL (personality), 0);
+ }
+-
+-#include "gt-expr.h"
+Index: gcc/expr.h
+===================================================================
+--- a/gcc/expr.h	(revision 188647)
++++ b/gcc/expr.h	(working copy)
+@@ -294,6 +294,7 @@ enum block_op_methods
+   BLOCK_OP_TAILCALL
+ };
+ 
++extern GTY(()) tree block_move_fn;
+ extern GTY(()) tree block_clear_fn;
+ extern void init_block_move_fn (const char *);
+ extern void init_block_clear_fn (const char *);
+Index: gcc/opts.c
+===================================================================
+--- a/gcc/opts.c	(revision 188647)
++++ b/gcc/opts.c	(working copy)
+@@ -1489,6 +1489,32 @@ common_handle_option (struct gcc_options
+       /* Deferred.  */
+       break;
+ 
++    case OPT_fcallgraph_info:
++      opts->x_flag_callgraph_info = CALLGRAPH_INFO_NAKED;
++      break;
++
++    case OPT_fcallgraph_info_:
++      {
++	char *my_arg, *p;
++	my_arg = xstrdup (arg);
++	p = strtok (my_arg, ",");
++	while (p)
++	  {
++	    if (strcmp (p, "su") == 0)
++	      {
++		opts->x_flag_callgraph_info |= CALLGRAPH_INFO_STACK_USAGE;
++		opts->x_flag_stack_usage_info = true;
++	      }
++	    else if (strcmp (p, "da") == 0)
++	      opts->x_flag_callgraph_info |= CALLGRAPH_INFO_DYNAMIC_ALLOC;
++	    else
++	      return 0;
++	    p = strtok (NULL, ",");
++	  }
++	free (my_arg);
++      }
++      break;
++
+     case OPT_fdiagnostics_show_location_:
+       diagnostic_prefixing_rule (dc) = (diagnostic_prefixing_rule_t) value;
+       break;
+Index: gcc/flag-types.h
+===================================================================
+--- a/gcc/flag-types.h	(revision 188647)
++++ b/gcc/flag-types.h	(working copy)
+@@ -159,6 +159,22 @@ enum stack_check_type
+   FULL_BUILTIN_STACK_CHECK
+ };
+ 
++/* Type of callgraph information.  */
++enum callgraph_info_type
++{
++  /* No information.  */
++  NO_CALLGRAPH_INFO = 0,
++
++  /* Naked callgraph.  */
++  CALLGRAPH_INFO_NAKED = 1,
++
++  /* Callgraph decorated with stack usage information.  */
++  CALLGRAPH_INFO_STACK_USAGE = 2,
++
++  /* Callgraph decoration with dynamic allocation information.  */
++  CALLGRAPH_INFO_DYNAMIC_ALLOC = 4
++};
++
+ /* Names for the different levels of -Wstrict-overflow=N.  The numeric
+    values here correspond to N.  */
+ 
+Index: gcc/gimplify.c
+===================================================================
+--- a/gcc/gimplify.c	(revision 188647)
++++ b/gcc/gimplify.c	(working copy)
+@@ -1452,6 +1452,9 @@ gimplify_vla_decl (tree decl, gimple_seq
+   /* Indicate that we need to restore the stack level when the
+      enclosing BIND_EXPR is exited.  */
+   gimplify_ctxp->save_stack = true;
++
++  if (flag_callgraph_info & CALLGRAPH_INFO_DYNAMIC_ALLOC)
++    cgraph_final_record_dynamic_alloc (current_function_decl, decl);
+ }
+ 
+ /* Gimplify a DECL_EXPR node *STMT_P by making any necessary allocation
+Index: gcc/calls.c
+===================================================================
+--- a/gcc/calls.c	(revision 188647)
++++ b/gcc/calls.c	(working copy)
+@@ -2654,6 +2654,10 @@ expand_call (tree exp, rtx target, int i
+ 
+   preferred_unit_stack_boundary = preferred_stack_boundary / BITS_PER_UNIT;
+ 
++  if (flag_callgraph_info)
++    cgraph_final_record_call (current_function_decl, fndecl,
++			      EXPR_LOCATION (exp));
++
+   /* We want to make two insn chains; one for a sibling call, the other
+      for a normal call.  We will select one of the two chains after
+      initial RTL generation is complete.  */
+@@ -4171,6 +4175,10 @@ emit_library_call_value_1 (int retval, r
+ 
+   before_call = get_last_insn ();
+ 
++  if (flag_callgraph_info)
++    cgraph_final_record_call (current_function_decl,
++			      SYMBOL_REF_DECL (orgfun), input_location);
++
+   /* We pass the old value of inhibit_defer_pop + 1 to emit_call_1, which
+      will set inhibit_defer_pop to that value.  */
+   /* The return type is needed to decide how many bytes the function pops.
+Index: gcc/print-tree.c
+===================================================================
+--- a/gcc/print-tree.c	(revision 188647)
++++ b/gcc/print-tree.c	(working copy)
+@@ -1011,3 +1011,69 @@ print_vec_tree (FILE *file, const char *
+       print_node (file, temp, elt, indent + 4);
+     }
+ }
++
++/* Print the identifier for DECL according to FLAGS.  */
++
++void
++print_decl_identifier (FILE *file, tree decl, int flags)
++{
++  bool needs_colon = false;
++  const char *name;
++  char *malloced_name = NULL;
++  char c;
++
++  if (flags & PRINT_DECL_ORIGIN)
++    {
++      if (DECL_IS_BUILTIN (decl))
++	fputs ("<built-in>", file);
++      else
++	{
++	  expanded_location loc
++	    = expand_location (DECL_SOURCE_LOCATION (decl));
++	  fprintf (file, "%s:%d:%d", loc.file, loc.line, loc.column);
++	}
++      needs_colon = true;
++    }
++
++  if (flags & PRINT_DECL_UNIQUE_NAME)
++    {
++      name = IDENTIFIER_POINTER (DECL_ASSEMBLER_NAME (decl));
++      if (!TREE_PUBLIC (decl)
++	  || (DECL_WEAK (decl) && !DECL_EXTERNAL (decl)))
++        /* The symbol has internal or weak linkage so its assembler name
++	   is not necessarily unique among the compilation units of the
++	   program.  We therefore have to further mangle it.  But we can't
++	   simply use DECL_SOURCE_FILE because it contains the name of the
++	   file the symbol originates from so, e.g. for function templates
++	   in C++ where the templates are defined in a header file, we can
++	   have symbols with the same assembler name and DECL_SOURCE_FILE.
++	   That's why we use the name of the top-level source file of the
++	   compilation unit.  ??? Unnecessary for Ada.  */
++	name = malloced_name = concat (main_input_filename, ":", name, NULL);
++    }
++  else if (flags & PRINT_DECL_NAME)
++    {
++      const char *dot;
++
++      name = lang_hooks.decl_printable_name (decl, 2);
++      dot = strrchr (name, '.');
++      if (dot)
++	name = dot + 1;
++    }
++  else
++    return;
++
++  if (needs_colon)
++    fputc (':', file);
++
++  while ((c = *name++) != '\0')
++    {
++      /* Strip double-quotes because of VCG.  */
++      if (c == '"')
++	continue;
++      fputc (c, file);
++    }
++
++  if (malloced_name)
++    free (malloced_name);
++}
+Index: gcc/common.opt
+===================================================================
+--- a/gcc/common.opt	(revision 188651)
++++ b/gcc/common.opt	(working copy)
+@@ -889,6 +889,14 @@ fbtr-bb-exclusive
+ Common Report Var(flag_btr_bb_exclusive) Optimization
+ Restrict target load migration not to re-use registers in any basic block
+ 
++fcallgraph-info
++Common Report RejectNegative Var(flag_callgraph_info) Init(NO_CALLGRAPH_INFO);
++Output callgraph information on a per-file basis
++
++fcallgraph-info=
++Common Report RejectNegative Joined
++Output callgraph information on a per-file basis with decorations
++
+ fcall-saved-
+ Common Joined RejectNegative Var(common_deferred_options) Defer
+ -fcall-saved-<register>	Mark <register> as being preserved across functions
+Index: gcc/output.h
+===================================================================
+--- a/gcc/output.h	(revision 188647)
++++ b/gcc/output.h	(working copy)
+@@ -608,7 +608,9 @@ extern int maybe_assemble_visibility (tr
+ 
+ extern int default_address_cost (rtx, enum machine_mode, addr_space_t, bool);
+ 
+-/* Output stack usage information.  */
++/* Stack usage.  */
++enum stack_usage_kind_type { SU_STATIC = 0, SU_DYNAMIC, SU_DYNAMIC_BOUNDED };
++extern const char *stack_usage_qual[];
+ extern void output_stack_usage (void);
+ 
+ #endif /* ! GCC_OUTPUT_H */
+Index: gcc/Makefile.in
+===================================================================
+--- a/gcc/Makefile.in	(revision 188647)
++++ b/gcc/Makefile.in	(working copy)
+@@ -2773,8 +2773,8 @@ expr.o : expr.c $(CONFIG_H) $(SYSTEM_H)
+    $(TREE_H) $(FLAGS_H) $(FUNCTION_H) $(REGS_H) $(EXPR_H) $(OPTABS_H) \
+    $(LIBFUNCS_H) $(INSN_ATTR_H) insn-config.h $(RECOG_H) output.h \
+    typeclass.h hard-reg-set.h toplev.h $(DIAGNOSTIC_CORE_H) hard-reg-set.h $(EXCEPT_H) \
+    reload.h langhooks.h intl.h $(TM_P_H) $(TARGET_H) \
+-   tree-iterator.h gt-expr.h $(MACHMODE_H) $(TIMEVAR_H) $(TREE_FLOW_H) \
++   tree-iterator.h $(MACHMODE_H) $(TIMEVAR_H) $(TREE_FLOW_H) \
+    $(TREE_PASS_H) $(DF_H) $(DIAGNOSTIC_H) $(SSAEXPAND_H) \
+    $(PARAMS_H) $(COMMON_TARGET_H) target-globals.h
+ dojump.o : dojump.c $(CONFIG_H) $(SYSTEM_H) coretypes.h $(TM_H) $(TM_P_H) \
+@@ -2862,8 +2862,8 @@ symtab.o : symtab.c $(CONFIG_H) $(SYSTEM_H
+    langhooks.h $(DIAGNOSTIC_CORE_H) $(FLAGS_H) $(GGC_H) $(TARGET_H) $(CGRAPH_H) \
+    $(TIMEVAR_H) $(HASHTAB_H) gt-symtab.h
+ cgraph.o : cgraph.c $(CONFIG_H) $(SYSTEM_H) coretypes.h dumpfile.h \
+    $(TM_H) $(TREE_H) $(TIMEVAR_H) \
+-   langhooks.h toplev.h $(DIAGNOSTIC_CORE_H) $(FLAGS_H) $(GGC_H) $(TARGET_H) $(CGRAPH_H) \
++   langhooks.h toplev.h $(DIAGNOSTIC_CORE_H) $(FLAGS_H) $(GGC_H) $(TARGET_H) $(CGRAPH_H) $(EXPR_H) output.h \
+    gt-cgraph.h intl.h $(BASIC_BLOCK_H) debug.h $(HASHTAB_H) \
+    $(TREE_INLINE_H) $(TREE_FLOW_H) cif-code.def \
+    value-prof.h $(EXCEPT_H) $(IPA_UTILS_H) $(DIAGNOSTIC_CORE_H) \
+Index: gcc/config/picochip/picochip.c
+===================================================================
+--- a/gcc/config/picochip/picochip.c	(revision 188647)
++++ b/gcc/config/picochip/picochip.c	(working copy)
+@@ -58,7 +58,7 @@ along with GCC; see the file COPYING3.
+ #include "optabs.h"		/* For GEN_FCN */
+ #include "basic-block.h"	/* UPDATE_LIFE_GLOBAL* for picochip_reorg. */
+ #include "timevar.h"		/* For TV_SCHED2, in picochip_reorg. */
+-#include "libfuncs.h"		/* For memcpy_libfuncs, etc. */
++#include "libfuncs.h"		/* For set_optab_libfunc. */
+ #include "df.h"			/* For df_regs_ever_live_df_regs_ever_live_pp, etc. */
+ 
+ 
