@@ -5,7 +5,7 @@
      }
  
 +  if (flag_stack_usage_info)
-+    current_function_static_stack_size = offset >= 0 ? offset : 0;
++    current_function_static_stack_size = total_size >= 0 ? total_size : 0;
 +
    if (TARGET_WINDOWED_ABI)
      {
