@@ -99,6 +99,7 @@ clean: clean-sdk
 	make -C crosstool-NG clean MAKELEVEL=0
 	-rm -rf crosstool-NG/.build/src
 	-rm -f crosstool-NG/local-patches/gcc/4.8.5/1000-*
+	-rm -f crosstool-NG/local-patches/gcc/4.8.5/1001-*
 	-rm -rf $(TOOLCHAIN)
 
 
@@ -110,6 +111,7 @@ toolchain: $(TOOLCHAIN)/bin/xtensa-lx106-elf-gcc
 
 $(TOOLCHAIN)/bin/xtensa-lx106-elf-gcc: crosstool-NG/ct-ng
 	cp -f 1000-mforce-l32.patch crosstool-NG/local-patches/gcc/4.8.5/
+	cp -f 1001-stack-usage-xtensa.patch crosstool-NG/local-patches/gcc/4.8.5/
 	make -C crosstool-NG -f ../Makefile _toolchain
 
 _toolchain:

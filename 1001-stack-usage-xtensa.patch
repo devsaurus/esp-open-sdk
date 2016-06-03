@@ -1,0 +1,12 @@
+--- a/gcc/config/xtensa/xtensa.c	2016-06-02 23:33:52.603897806 +0200
++++ b/gcc/config/xtensa/xtensa.c	2016-06-02 23:33:11.668210022 +0200
+@@ -2827,6 +2827,9 @@
+ 	}
+     }
+ 
++  if (flag_stack_usage_info)
++    current_function_static_stack_size = offset >= 0 ? offset : 0;
++
+   if (TARGET_WINDOWED_ABI)
+     {
+       /* Create a note to describe the CFA.  Because this is only used to set
